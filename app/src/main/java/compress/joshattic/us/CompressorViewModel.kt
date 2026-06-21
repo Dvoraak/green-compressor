@@ -571,7 +571,9 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun setTargetSize(mb: Float) {
-        _uiState.update { it.copy(targetSizeMb = mb, activePreset = QualityPreset.CUSTOM).autoAdjust(mb) }
+        // allowUpward = false: only enforce quality floor, never override the user's explicit
+        // resolution/FPS/audio choices just because there's size headroom.
+        _uiState.update { it.copy(targetSizeMb = mb, activePreset = QualityPreset.CUSTOM).autoAdjust(mb, allowUpward = false) }
     }
 
     fun setVideoCodec(codec: String) {
@@ -616,10 +618,11 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun setAudioBitrate(bitrate: Int) {
-        _uiState.update { 
+        _uiState.update {
             val temp = it.copy(audioBitrate = bitrate, activePreset = QualityPreset.CUSTOM)
-            // Increasing bitrate increases minimumSizeMb.
-            temp.autoAdjust(temp.targetSizeMb) 
+            // Lock audio bitrate so autoAdjust can't override the user's explicit choice upward.
+            // Video quality (resolution/fps) will compensate if minimumSizeMb exceeds the target.
+            temp.autoAdjust(temp.targetSizeMb, lockAudioBitrate = true)
         }
     }
 
@@ -725,10 +728,10 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
 
         val targetBitrate = currentState.targetBitrate.toLong()
 
-        // getAudioBitrate uses MediaExtractor (I/O) — resolve it on IO before building the transformer
+        // audioBitrate == 0 means "Original" — use the detected original bitrate from state.
+        // Avoid re-running the extractor here; KEY_BIT_RATE is often absent and returns 0.
         val audioBitrateToUse = if (currentState.audioBitrate == 0) {
-            val original = kotlinx.coroutines.withContext(Dispatchers.IO) { getAudioBitrate(context, inputUri) }
-            if (original > 0) original else 256_000
+            if (currentState.originalAudioBitrate > 0) currentState.originalAudioBitrate else 128_000
         } else {
             currentState.audioBitrate
         }
@@ -870,8 +873,17 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         }
         
         val mediaItem = MediaItem.fromUri(inputUri)
+        // SonicAudioProcessor at default 1.0x speed/pitch is an identity transform, but its
+        // presence prevents Media3 from doing audio passthrough. Without it, when the source is
+        // already AAC, Transformer copies the stream verbatim and AudioEncoderSettings.bitrate
+        // is never consulted — explaining why the user's chosen audio bitrate was ignored.
+        val audioProcessors: List<androidx.media3.common.audio.AudioProcessor> = if (!currentState.removeAudio) {
+            listOf(androidx.media3.common.audio.SonicAudioProcessor())
+        } else {
+            emptyList()
+        }
         val editedMediaItem = EditedMediaItem.Builder(mediaItem)
-            .setEffects(Effects(emptyList(), effectsList))
+            .setEffects(Effects(audioProcessors, effectsList))
             .setRemoveAudio(currentState.removeAudio)
             .build()
 

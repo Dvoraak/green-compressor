@@ -1529,29 +1529,40 @@ fun AudioOptionsTab(state: CompressorUiState, viewModel: CompressorViewModel) {
                         .padding(top = 8.dp),
                      horizontalArrangement = Arrangement.spacedBy(8.dp)
                  ) {
-                     val bitrates = listOf(0, 320000, 256000, 192000, 160000, 128000, 96000, 64000)
+                     val bitrates = listOf(320000, 256000, 192000, 160000, 128000, 96000, 64000)
+                     // Show "Original" chip first
+                     val origSource = remember { MutableInteractionSource() }
+                     val effectiveSelected = if (state.audioBitrate == 0) state.originalAudioBitrate else state.audioBitrate
+                     FilterChip(
+                         selected = state.audioBitrate == 0 || (state.originalAudioBitrate > 0 && effectiveSelected == state.originalAudioBitrate),
+                         onClick = {
+                             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                             viewModel.setAudioBitrate(0)
+                         },
+                         interactionSource = origSource,
+                         label = {
+                             if (state.originalAudioBitrate > 0) {
+                                 Text(stringResource(R.string.original) + " • ${state.originalAudioBitrate / 1000}k")
+                             } else {
+                                 Text(stringResource(R.string.original))
+                             }
+                         },
+                         modifier = Modifier.expressiveScale(origSource)
+                     )
+                     // Show all lower bitrate options. When originalAudioBitrate is known, only show
+                     // chips below it. When unknown (0), show all chips so the user isn't locked out.
                      bitrates.forEach { rate ->
-                         if (rate == 0 || (state.originalAudioBitrate > 0 && rate <= state.originalAudioBitrate)) {
-                             val effectiveSelectedBitrate = if (state.audioBitrate == 0) state.originalAudioBitrate else state.audioBitrate
-                             val chipRepresentsBitrate = if (rate == 0) state.originalAudioBitrate else rate
-                             
-                             val isSelected = effectiveSelectedBitrate == chipRepresentsBitrate
-                             
+                         val showChip = state.originalAudioBitrate == 0 || rate < state.originalAudioBitrate
+                         if (showChip) {
                              val iSource = remember { MutableInteractionSource() }
                              FilterChip(
-                                 selected = isSelected,
-                                 onClick = { 
+                                 selected = state.audioBitrate == rate,
+                                 onClick = {
                                      haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                     viewModel.setAudioBitrate(rate) 
+                                     viewModel.setAudioBitrate(rate)
                                  },
                                  interactionSource = iSource,
-                                 label = { 
-                                     if (rate == 0) {
-                                         Text(stringResource(R.string.original) + " • ${state.originalAudioBitrate / 1000}k")
-                                     } else {
-                                         Text("${rate / 1000}k") 
-                                     }
-                                 },
+                                 label = { Text("${rate / 1000}k") },
                                  modifier = Modifier.expressiveScale(iSource)
                              )
                          }
