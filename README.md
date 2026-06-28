@@ -84,8 +84,9 @@ APK lands at `app/build/outputs/apk/release/app-release.apk`.
 ## Release flow
 
 The `.github/workflows/release.yml` action fires on every `v*` tag, builds a
-release-mode APK signed with the debug keystore (stable across builds so
-Android accepts upgrades), and attaches it to a GitHub Release as
+release-mode APK signed with `app/release.keystore` (a committed keystore so
+every build on every machine produces the same signature, and Android
+accepts in-place upgrades), and attaches it to a GitHub Release as
 `GreenCompressor-v<TAG>.apk`. To cut a new version:
 
 ```bash

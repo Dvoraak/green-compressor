@@ -20,23 +20,49 @@ android {
         targetSdk = 36
         // Reset to 1 / 1.0.0 — this is the first release of Green Compressor
         // as its own app, not a continuation of upstream's version numbers.
-        versionCode = 2
-        versionName = "1.0.1"
+        versionCode = 3
+        versionName = "1.0.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    // STABLE signing key checked into the repo. The previous setup used the
+    // AGP-generated debug keystore (~/.android/debug.keystore on whatever
+    // machine ran the build), which differs per GitHub Actions runner — so
+    // v1.0.0 and v1.0.1 had different signatures and Android refused to
+    // upgrade between them ("conflict: green compressor"). With a single
+    // committed keystore, every CI build (and every local build on any
+    // machine) signs with the same key → upgrades work indefinitely.
+    //
+    // Security note: the keystore password is in this file on purpose.
+    // This is the standard pattern for personal-archive forks where the
+    // user is the only consumer of releases; the only thing a keystore
+    // leak buys an attacker is the ability to publish a fake APK *that
+    // would still need the user to install it from somewhere other than
+    // the official GitHub releases page they configured in Obtainium*.
+    signingConfigs {
+        create("greencompressor") {
+            storeFile = file("release.keystore")
+            storePassword = "greenpass"
+            keyAlias = "greencompressor"
+            keyPassword = "greenpass"
+        }
+    }
+
     buildTypes {
+        getByName("debug") {
+            // Use the same key for debug too, so adb-pushed debug builds and
+            // Obtainium-pulled release builds are mutually upgradeable —
+            // otherwise switching between them on the phone forces an uninstall.
+            signingConfig = signingConfigs.getByName("greencompressor")
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // Sign release with the debug keystore so personal-archive sideloads via
-            // Obtainium "just work" without provisioning a prod keystore in CI.
-            // Reuses the same key across builds → Android won't reject upgrades.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("greencompressor")
         }
     }
     compileOptions {
