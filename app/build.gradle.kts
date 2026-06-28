@@ -13,9 +13,9 @@ android {
     defaultConfig {
         applicationId = "compress.joshattic.us"
         minSdk = 24
-        targetSdk = 37
-        versionCode = 22
-        versionName = "1.5.7"
+        targetSdk = 36
+        versionCode = 23
+        versionName = "1.6.0-archive"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -27,6 +27,10 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Sign release with the debug keystore so personal-archive sideloads via
+            // Obtainium "just work" without provisioning a prod keystore in CI.
+            // Reuses the same key across builds → Android won't reject upgrades.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {

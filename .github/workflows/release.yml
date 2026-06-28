@@ -1,0 +1,61 @@
+name: Build & Publish Release APK
+
+# Triggered by pushing a semver tag like `v1.6.0`. The job builds a release-mode
+# APK, signs it with the debug keystore (so the user can sideload without
+# generating one), and attaches it to a GitHub Release with a name that
+# Obtainium's GitHub source recognizes. Re-tag with the same version after
+# fixing the workflow if the first attempt fails — keep tags monotonically
+# increasing across actual code changes.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v1.6.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      # Release mode catches more issues (R8 / minify) than debug. We sign with
+      # the debug keystore on purpose — generating a production keystore is out
+      # of scope for an archive-fork build, and the debug certificate is fine
+      # for personal sideloads via Obtainium.
+      - name: Build Release APK
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Find APK
+        id: find_apk
+        run: |
+          APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          echo "Found APK: $APK"
+          NEW_NAME="Compressor-archive-${GITHUB_REF_NAME}.apk"
+          cp "$APK" "$NEW_NAME"
+          echo "apk_path=$NEW_NAME" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: ${{ steps.find_apk.outputs.apk_path }}

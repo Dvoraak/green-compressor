@@ -4,6 +4,12 @@
 
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove" />
 
+    <!-- Required to read un-redacted GPS metadata from picker-selected videos via
+         MediaStore.setRequireOriginal. Without it, METADATA_KEY_LOCATION comes back
+         blank for items reached through the photo picker, and we'd strip GPS on
+         every compress — defeating the archive workflow. -->
+    <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"

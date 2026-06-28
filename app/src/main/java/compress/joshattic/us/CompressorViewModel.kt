@@ -45,6 +45,15 @@ enum class QualityPreset {
     HIGH, MEDIUM, LOW, CUSTOM
 }
 
+data class BatchItemResult(
+    val originalUri: Uri,
+    val originalName: String?,
+    val originalSize: Long,
+    val finalSize: Long,
+    val success: Boolean,
+    val error: String? = null,
+)
+
 // All sorted so nicely :D
 data class CompressorUiState(
     val selectedUri: Uri? = null,
@@ -57,7 +66,11 @@ data class CompressorUiState(
     val originalVideoMime: String? = null,
     val durationMs: Long = 0L,
     val originalName: String? = null,
-    
+
+    // Source metadata we want to round-trip onto the compressed copy.
+    val originalDateTakenMs: Long = 0L,
+    val originalLocation: String? = null,
+
     val isCompressing: Boolean = false,
     val progress: Float = 0f,
     val compressedUri: Uri? = null,
@@ -66,7 +79,7 @@ data class CompressorUiState(
     val error: String? = null,
     val errorLog: String? = null,
     val saveSuccess: Boolean = false,
-    
+
     // Configuration
     val activePreset: QualityPreset = QualityPreset.HIGH,
     val targetSizeMb: Float = 10f,
@@ -74,19 +87,31 @@ data class CompressorUiState(
     val videoCodec: String = MimeTypes.VIDEO_H265,
     val targetResolutionHeight: Int = 0, // 0 means original
     val targetFps: Int = 0, // 0 means original
-    
+
     val totalSavedBytes: Long = 0L,
-    
+
     val supportedCodecs: List<String> = emptyList(),
-    val appInfoVersion: String = "1.5.7",
+    val appInfoVersion: String = "1.6.0-archive",
     val showBitrate: Boolean = false,
     val useMbps: Boolean = false,
     val hasShared: Boolean = false,
     val removeAudio: Boolean = false,
     val audioBitrate: Int = 128_000,
     val audioVolume: Float = 1.0f,
-    val warnings: List<String> = emptyList()
+    val warnings: List<String> = emptyList(),
+
+    // Batch state. queue.size <= 1 → behaves like the original mono-video flow.
+    val batchQueue: List<Uri> = emptyList(),
+    val batchIndex: Int = 0,
+    val batchResults: List<BatchItemResult> = emptyList(),
+    val batchInPlace: Boolean = false,
+    val batchActive: Boolean = false,
+    val pendingDeleteUris: List<Uri> = emptyList(),
+    val batchComplete: Boolean = false,
 ) {
+    val isBatch: Boolean get() = batchQueue.size > 1
+    val batchTotal: Int get() = batchQueue.size
+    val batchPosition: Int get() = (batchIndex + 1).coerceAtMost(batchTotal.coerceAtLeast(1))
     private val minBitrate: Long
         get() {
             val h = if (targetResolutionHeight > 0) targetResolutionHeight else originalHeight
@@ -418,91 +443,254 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
     private var activeTransformer: Transformer? = null
 
     fun updateSelectedUri(context: Context, uri: Uri) {
+        loadSelectedUri(context, uri, preserveBatchAndPreset = false)
+    }
+
+    private fun loadSelectedUri(context: Context, uri: Uri, preserveBatchAndPreset: Boolean) {
         viewModelScope.launch(Dispatchers.IO) {
-            var size = 0L
-            var width = 0
-            var height = 0
-            var bitrate = 0
-            var audioBitrate = 0
-            var fps = 30f
-            var videoMime: String? = null
-            var duration = 0L
-            var originalName: String? = null
+            val meta = readSourceMetadata(context, uri)
 
-            try {
-                audioBitrate = getAudioBitrate(context, uri)
-                val videoInfo = getVideoTrackInfo(context, uri)
-                videoMime = videoInfo?.mimeType
-                context.contentResolver.openFileDescriptor(uri, "r")?.use {
-                    size = it.statSize
-                }
-                val retriever = android.media.MediaMetadataRetriever()
-                retriever.setDataSource(context, uri)
+            val defaultTargetMb = if (meta.size > 0) (meta.size / (1024.0 * 1024.0) * 0.7).toFloat() else 10f
 
-                width = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
-                height = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+            val carry = _uiState.value
+            val keepBatch = preserveBatchAndPreset && carry.batchActive
+            val activePreset = if (preserveBatchAndPreset) carry.activePreset else QualityPreset.HIGH
 
-                val rotation = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
-                if (rotation == 90 || rotation == 270) {
-                    val temp = width
-                    width = height
-                    height = temp
-                }
+            val next = CompressorUiState(
+                selectedUri = uri,
+                originalSize = meta.size,
+                originalWidth = meta.width,
+                originalHeight = meta.height,
+                originalBitrate = meta.bitrate,
+                originalAudioBitrate = meta.audioBitrate,
+                originalFps = meta.fps,
+                originalVideoMime = meta.videoMime,
+                durationMs = meta.duration,
+                originalName = meta.name,
+                originalDateTakenMs = meta.dateTakenMs,
+                originalLocation = meta.location,
+                targetSizeMb = defaultTargetMb,
+                targetResolutionHeight = meta.height,
+                activePreset = activePreset,
+                totalSavedBytes = carry.totalSavedBytes,
+                showBitrate = carry.showBitrate,
+                useMbps = carry.useMbps,
+                supportedCodecs = carry.supportedCodecs,
+                videoCodec = carry.videoCodec,
+                useH265 = carry.useH265,
+                // Preserve batch context across queue items.
+                batchQueue = if (keepBatch) carry.batchQueue else emptyList(),
+                batchIndex = if (keepBatch) carry.batchIndex else 0,
+                batchResults = if (keepBatch) carry.batchResults else emptyList(),
+                batchInPlace = if (keepBatch) carry.batchInPlace else false,
+                batchActive = keepBatch,
+                // Preserve in-flight compressing flag — advanceBatch sets isCompressing=true
+                // BEFORE calling loadSelectedUri so the UI doesn't flash ConfigScreen between
+                // items. Constructing a fresh state object would otherwise reset it to false.
+                isCompressing = keepBatch && carry.isCompressing,
+            ).autoAdjust(defaultTargetMb)
 
-                bitrate = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toIntOrNull() ?: 0
-                duration = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            // Re-apply preset against the new item's resolution so all batch items
+            // get the same quality bucket (HIGH/MEDIUM/LOW) recomputed per video.
+            _uiState.value = next
+            if (preserveBatchAndPreset && activePreset != QualityPreset.CUSTOM) {
+                applyPreset(activePreset)
+            }
+        }
+    }
 
-                // FPS extraction is flaky, sometimes in CAPTURE_FRAMERATE or needs calculation
-                val fpsStr = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
-                fps = fpsStr?.toFloatOrNull() ?: 0f
-                if (fps <= 0f && videoInfo != null && videoInfo.frameRate > 0f) {
-                    fps = videoInfo.frameRate
-                }
-                if (fps <= 0f) {
-                    fps = 30f
-                }
+    private data class SourceMetadata(
+        val size: Long,
+        val width: Int,
+        val height: Int,
+        val bitrate: Int,
+        val audioBitrate: Int,
+        val fps: Float,
+        val videoMime: String?,
+        val duration: Long,
+        val name: String?,
+        val dateTakenMs: Long,
+        val location: String?,
+    )
 
-                val cursor = context.contentResolver.query(uri, null, null, null, null)
-                if (cursor != null && cursor.moveToFirst()) {
-                    val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-                    if (nameIndex != -1) {
-                        originalName = cursor.getString(nameIndex)
-                    }
-                    cursor.close()
-                }
+    private fun readSourceMetadata(context: Context, uri: Uri): SourceMetadata {
+        var size = 0L
+        var width = 0
+        var height = 0
+        var bitrate = 0
+        var audioBitrate = 0
+        var fps = 30f
+        var videoMime: String? = null
+        var duration = 0L
+        var originalName: String? = null
+        var dateTakenMs = 0L
+        var location: String? = null
 
-                retriever.release()
-            } catch (e: Exception) {
-                e.printStackTrace()
+        try {
+            audioBitrate = getAudioBitrate(context, uri)
+            val videoInfo = getVideoTrackInfo(context, uri)
+            videoMime = videoInfo?.mimeType
+            context.contentResolver.openFileDescriptor(uri, "r")?.use {
+                size = it.statSize
             }
 
-            val defaultTargetMb = if (size > 0) (size / (1024.0 * 1024.0) * 0.7).toFloat() else 10f
+            // Ask MediaStore for the un-redacted URI so METADATA_KEY_LOCATION
+            // returns the real GPS string instead of being scrubbed. This needs
+            // the ACCESS_MEDIA_LOCATION permission declared in the manifest.
+            val sourceUriForReading = try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    MediaStore.setRequireOriginal(uri)
+                } else uri
+            } catch (_: SecurityException) {
+                uri
+            } catch (_: Exception) {
+                uri
+            }
 
-            val currentSavedBytes = _uiState.value.totalSavedBytes
-            val showBitrate = _uiState.value.showBitrate
-            val useMbps = _uiState.value.useMbps
-            val supportedCodecs = _uiState.value.supportedCodecs
+            val retriever = android.media.MediaMetadataRetriever()
+            retriever.setDataSource(context, sourceUriForReading)
 
+            width = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+            height = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+
+            val rotation = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+            if (rotation == 90 || rotation == 270) {
+                val temp = width
+                width = height
+                height = temp
+            }
+
+            bitrate = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toIntOrNull() ?: 0
+            duration = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+
+            val fpsStr = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
+            fps = fpsStr?.toFloatOrNull() ?: 0f
+            if (fps <= 0f && videoInfo != null && videoInfo.frameRate > 0f) {
+                fps = videoInfo.frameRate
+            }
+            if (fps <= 0f) fps = 30f
+
+            location = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_LOCATION)?.takeIf { it.isNotBlank() }
+
+            // ISO-8601-ish date from the container ("20231215T142233.000Z" etc.) — only used
+            // as a fallback. Prefer MediaStore.DATE_TAKEN when the picker hands us a gallery item.
+            val containerDate = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DATE)
+            if (!containerDate.isNullOrBlank()) {
+                dateTakenMs = parseContainerDate(containerDate)
+            }
+
+            val cursor = context.contentResolver.query(
+                uri,
+                arrayOf(
+                    android.provider.OpenableColumns.DISPLAY_NAME,
+                    MediaStore.Video.Media.DATE_TAKEN,
+                ),
+                null, null, null
+            )
+            if (cursor != null) {
+                try {
+                    if (cursor.moveToFirst()) {
+                        val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                        if (nameIndex >= 0) originalName = cursor.getString(nameIndex)
+                        val dtIdx = cursor.getColumnIndex(MediaStore.Video.Media.DATE_TAKEN)
+                        if (dtIdx >= 0 && !cursor.isNull(dtIdx)) {
+                            val ms = cursor.getLong(dtIdx)
+                            // MediaStore reports DATE_TAKEN as ms-since-epoch; prefer it over container date
+                            if (ms > 0) dateTakenMs = ms
+                        }
+                    }
+                } finally {
+                    cursor.close()
+                }
+            }
+
+            retriever.release()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        return SourceMetadata(
+            size = size,
+            width = width,
+            height = height,
+            bitrate = bitrate,
+            audioBitrate = audioBitrate,
+            fps = fps,
+            videoMime = videoMime,
+            duration = duration,
+            name = originalName,
+            dateTakenMs = dateTakenMs,
+            location = location,
+        )
+    }
+
+    private fun parseContainerDate(raw: String): Long {
+        // Common Pixel/Camera forms: "20231215T142233.000Z", "20231215T142233Z", "2023-12-15T14:22:33.000Z"
+        val patterns = listOf(
+            "yyyyMMdd'T'HHmmss.SSS'Z'",
+            "yyyyMMdd'T'HHmmss'Z'",
+            "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",
+            "yyyy-MM-dd'T'HH:mm:ss'Z'",
+        )
+        for (p in patterns) {
+            try {
+                val sdf = java.text.SimpleDateFormat(p, java.util.Locale.US)
+                sdf.timeZone = java.util.TimeZone.getTimeZone("UTC")
+                val d = sdf.parse(raw) ?: continue
+                return d.time
+            } catch (_: Exception) {
+            }
+        }
+        return 0L
+    }
+
+    /** Multi-pick entry point. Loads the first item; rest stay queued for after compression. */
+    fun setBatchUris(context: Context, uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        if (uris.size == 1) {
+            updateSelectedUri(context, uris[0])
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val first = uris[0]
+            val meta = readSourceMetadata(context, first)
+            val defaultTargetMb = if (meta.size > 0) (meta.size / (1024.0 * 1024.0) * 0.7).toFloat() else 10f
+            val carry = _uiState.value
             _uiState.value = CompressorUiState(
-                selectedUri = uri,
-                originalSize = size,
-                originalWidth = width,
-                originalHeight = height,
-                originalBitrate = bitrate,
-                originalAudioBitrate = audioBitrate,
-                originalFps = fps,
-                originalVideoMime = videoMime,
-                durationMs = duration,
-                originalName = originalName,
+                selectedUri = first,
+                originalSize = meta.size,
+                originalWidth = meta.width,
+                originalHeight = meta.height,
+                originalBitrate = meta.bitrate,
+                originalAudioBitrate = meta.audioBitrate,
+                originalFps = meta.fps,
+                originalVideoMime = meta.videoMime,
+                durationMs = meta.duration,
+                originalName = meta.name,
+                originalDateTakenMs = meta.dateTakenMs,
+                originalLocation = meta.location,
                 targetSizeMb = defaultTargetMb,
-                targetResolutionHeight = height,
+                targetResolutionHeight = meta.height,
                 activePreset = QualityPreset.HIGH,
-                totalSavedBytes = currentSavedBytes,
-                showBitrate = showBitrate,
-                useMbps = useMbps,
-                supportedCodecs = supportedCodecs
+                totalSavedBytes = carry.totalSavedBytes,
+                showBitrate = carry.showBitrate,
+                useMbps = carry.useMbps,
+                supportedCodecs = carry.supportedCodecs,
+                videoCodec = carry.videoCodec,
+                useH265 = carry.useH265,
+                batchQueue = uris,
+                batchIndex = 0,
+                batchActive = true,
             ).autoAdjust(defaultTargetMb)
         }
+    }
+
+    fun setBatchInPlace(value: Boolean) {
+        _uiState.update { it.copy(batchInPlace = value) }
+    }
+
+    fun consumePendingDeletes() {
+        _uiState.update { it.copy(pendingDeleteUris = emptyList()) }
     }
     
     fun markAsShared() {
@@ -801,49 +989,92 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             .setEncoderFactory(encoderFactory)
             .addListener(object : Transformer.Listener {
                 override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                     val finalSize = outputFile.length()
-                     val savedBytes = currentState.originalSize - finalSize
-                     var newTotal = _uiState.value.totalSavedBytes
-                     
-                     if (savedBytes > 0) {
-                         newTotal += savedBytes
-                         prefs.edit { putLong("total_saved_bytes", newTotal) }
-                     }
+                    // Stamp the cached file with date + GPS BEFORE it gets copied into MediaStore.
+                    // Doing it here (single place, after every successful encode) keeps mono and
+                    // batch paths in sync — both save flows just copy the patched bytes.
+                    try {
+                        Mp4MetadataPatcher.patch(
+                            outputFile,
+                            currentState.originalDateTakenMs,
+                            currentState.originalLocation,
+                        )
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
 
-                     _uiState.update { 
-                         it.copy(
-                             isCompressing = false, 
-                             progress = 1f, 
-                             compressedUri = Uri.fromFile(outputFile),
-                             compressedSize = finalSize,
-                             totalSavedBytes = newTotal
-                         ) 
-                     }
+                    val finalSize = outputFile.length()
+                    val savedBytes = currentState.originalSize - finalSize
+                    var newTotal = _uiState.value.totalSavedBytes
+
+                    if (savedBytes > 0) {
+                        newTotal += savedBytes
+                        prefs.edit { putLong("total_saved_bytes", newTotal) }
+                    }
+
+                    _uiState.update {
+                        it.copy(
+                            isCompressing = false,
+                            progress = 1f,
+                            compressedUri = Uri.fromFile(outputFile),
+                            compressedSize = finalSize,
+                            totalSavedBytes = newTotal
+                        )
+                    }
+
+                    // Batch mode: zero-interaction-per-file. Auto-save then advance to next
+                    // item (or finalize the batch). The user sees CompressingScreen continuously
+                    // until the whole queue is done; no per-item ResultScreen prompt.
+                    if (_uiState.value.isBatch) {
+                        autoSaveAndAdvance(context)
+                    }
                 }
 
                 override fun onError(composition: Composition, exportResult: ExportResult, exportException: ExportException) {
                     val app = getApplication<Application>()
-                    _uiState.update { 
-                        val isCodecError = exportException.errorCode == ExportException.ERROR_CODE_DECODER_INIT_FAILED ||
-                                           exportException.errorCode == ExportException.ERROR_CODE_ENCODER_INIT_FAILED
-                        val isDecoderInitError = exportException.errorCode == ExportException.ERROR_CODE_DECODER_INIT_FAILED
-                        val isEncoderInitError = exportException.errorCode == ExportException.ERROR_CODE_ENCODER_INIT_FAILED
-                        val isMuxerError = exportException.errorCode == ExportException.ERROR_CODE_MUXING_FAILED
-                        val isHuawei = android.os.Build.MANUFACTURER.equals("HUAWEI", ignoreCase = true)
+                    val isCodecError = exportException.errorCode == ExportException.ERROR_CODE_DECODER_INIT_FAILED ||
+                        exportException.errorCode == ExportException.ERROR_CODE_ENCODER_INIT_FAILED
+                    val isDecoderInitError = exportException.errorCode == ExportException.ERROR_CODE_DECODER_INIT_FAILED
+                    val isEncoderInitError = exportException.errorCode == ExportException.ERROR_CODE_ENCODER_INIT_FAILED
+                    val isMuxerError = exportException.errorCode == ExportException.ERROR_CODE_MUXING_FAILED
+                    val isHuawei = android.os.Build.MANUFACTURER.equals("HUAWEI", ignoreCase = true)
 
-                        val errorMsg = when {
-                            isMuxerError && isHuawei -> app.getString(R.string.error_huawei_muxer)
-                            isDecoderInitError -> app.getString(R.string.error_decoder_config_unsupported)
-                            isEncoderInitError -> app.getString(R.string.error_encoder_config_unsupported)
-                            isCodecError -> app.getString(R.string.error_codec_unsupported)
-                            else -> exportException.localizedMessage ?: app.getString(R.string.error_unknown)
-                        }
+                    val errorMsg = when {
+                        isMuxerError && isHuawei -> app.getString(R.string.error_huawei_muxer)
+                        isDecoderInitError -> app.getString(R.string.error_decoder_config_unsupported)
+                        isEncoderInitError -> app.getString(R.string.error_encoder_config_unsupported)
+                        isCodecError -> app.getString(R.string.error_codec_unsupported)
+                        else -> exportException.localizedMessage ?: app.getString(R.string.error_unknown)
+                    }
 
-                        it.copy(
-                            isCompressing = false, 
+                    // In batch mode, one item failing must not kill the rest of the queue.
+                    // Record the failure and advance so the user gets a per-item summary at the end.
+                    if (_uiState.value.isBatch) {
+                        val cur = _uiState.value
+                        val failed = BatchItemResult(
+                            originalUri = cur.selectedUri ?: Uri.EMPTY,
+                            originalName = cur.originalName,
+                            originalSize = cur.originalSize,
+                            finalSize = 0L,
+                            success = false,
                             error = errorMsg,
-                            errorLog = exportException.stackTraceToString()
-                        ) 
+                        )
+                        _uiState.update {
+                            it.copy(
+                                isCompressing = false,
+                                error = null,
+                                errorLog = null,
+                                batchResults = it.batchResults + failed,
+                            )
+                        }
+                        advanceBatch(context)
+                    } else {
+                        _uiState.update {
+                            it.copy(
+                                isCompressing = false,
+                                error = errorMsg,
+                                errorLog = exportException.stackTraceToString()
+                            )
+                        }
                     }
                 }
             })
@@ -1160,71 +1391,179 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun saveToGallery(context: Context) {
-        val currentState = _uiState.value
-        val compressedUri = currentState.compressedUri ?: return
-        
         viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val file = File(compressedUri.path!!)
-                if (!file.exists()) {
-                    _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_file_lost)) }
-                    return@launch
-                }
+            saveToGalleryBlocking(context)
+        }
+    }
 
-                val targetName = if (currentState.originalName != null) {
-                    val nameWithoutExt = currentState.originalName.substringBeforeLast(".")
-                    "${nameWithoutExt}_Compressed.mp4"
-                } else {
-                    "Compressed_${System.currentTimeMillis()}.mp4"
-                }
-
-                val values = ContentValues().apply {
-                    put(MediaStore.Video.Media.DISPLAY_NAME, targetName)
-                    put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                    put(MediaStore.Video.Media.DATE_ADDED, System.currentTimeMillis() / 1000)
-
-                    if (!containsKey(MediaStore.Video.Media.DATE_ADDED)) {
-                        put(MediaStore.Video.Media.DATE_ADDED, System.currentTimeMillis() / 1000)
-                    }
-                    if (!containsKey(MediaStore.Video.Media.DATE_MODIFIED)) {
-                        put(MediaStore.Video.Media.DATE_MODIFIED, System.currentTimeMillis() / 1000)
-                    }
-
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        put(MediaStore.Video.Media.IS_PENDING, 1)
-                        put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/Compressor")
-                    }
-                }
-
-                val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-                } else {
-                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-                }
-
-                val itemUri = context.contentResolver.insert(collection, values)
-                
-                if (itemUri != null) {
-                    context.contentResolver.openOutputStream(itemUri).use { out ->
-                        file.inputStream().use { input ->
-                            input.copyTo(out!!)
-                        }
-                    }
-                    
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        values.clear()
-                        values.put(MediaStore.Video.Media.IS_PENDING, 0)
-                        context.contentResolver.update(itemUri, values, null, null)
-                    }
-                    
-                    _uiState.update { it.copy(saveSuccess = true) }
-                } else {
-                     _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_gallery_entry)) }
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-                _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_save_failed, e.message)) }
+    private suspend fun saveToGalleryBlocking(context: Context): Boolean = withContext(Dispatchers.IO) {
+        val currentState = _uiState.value
+        val compressedUri = currentState.compressedUri ?: return@withContext false
+        try {
+            val file = File(compressedUri.path!!)
+            if (!file.exists()) {
+                _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_file_lost)) }
+                return@withContext false
             }
+
+            val targetName = if (currentState.originalName != null) {
+                val nameWithoutExt = currentState.originalName.substringBeforeLast(".")
+                "${nameWithoutExt}_Compressed.mp4"
+            } else {
+                "Compressed_${System.currentTimeMillis()}.mp4"
+            }
+
+            // Source DATE_TAKEN drives chronological ordering in Google Photos / gallery apps.
+            // Without it, every archive copy lands at the top of the timeline ("just added"),
+            // which is the original bug that motivated this fork.
+            val dateTakenForStore = if (currentState.originalDateTakenMs > 0) {
+                currentState.originalDateTakenMs
+            } else 0L
+
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, targetName)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.DATE_ADDED, System.currentTimeMillis() / 1000)
+                put(MediaStore.Video.Media.DATE_MODIFIED, System.currentTimeMillis() / 1000)
+                if (dateTakenForStore > 0) {
+                    put(MediaStore.Video.Media.DATE_TAKEN, dateTakenForStore)
+                }
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(MediaStore.Video.Media.IS_PENDING, 1)
+                    put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/Compressor")
+                }
+            }
+
+            val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            } else {
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+            }
+
+            val itemUri = context.contentResolver.insert(collection, values)
+
+            if (itemUri != null) {
+                context.contentResolver.openOutputStream(itemUri).use { out ->
+                    file.inputStream().use { input ->
+                        input.copyTo(out!!)
+                    }
+                }
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    values.clear()
+                    values.put(MediaStore.Video.Media.IS_PENDING, 0)
+                    context.contentResolver.update(itemUri, values, null, null)
+                }
+
+                _uiState.update { it.copy(saveSuccess = true) }
+                return@withContext true
+            } else {
+                _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_gallery_entry)) }
+                return@withContext false
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_save_failed, e.message)) }
+            return@withContext false
+        }
+    }
+
+    /**
+     * Batch path: called from onCompleted when batch is active. Saves the current item
+     * with metadata, records the result, and either kicks off the next item or finalizes
+     * the batch.
+     */
+    private fun autoSaveAndAdvance(context: Context) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val before = _uiState.value
+            val saved = saveToGalleryBlocking(context)
+            val after = _uiState.value
+            val item = BatchItemResult(
+                originalUri = before.selectedUri ?: Uri.EMPTY,
+                originalName = before.originalName,
+                originalSize = before.originalSize,
+                finalSize = after.compressedSize,
+                success = saved,
+                error = if (!saved) after.error else null,
+            )
+            // Drop the per-item cache file once it's safely copied into MediaStore. A 30-item
+            // batch of 200 MB videos would otherwise hoard up to ~3 GB of cache before the
+            // user resets, which can OOM-disk mid-batch on a near-full phone.
+            if (saved) {
+                try {
+                    after.compressedUri?.path?.let { p ->
+                        val f = File(p)
+                        if (f.exists()) f.delete()
+                    }
+                } catch (_: Exception) { /* best-effort */ }
+            }
+            _uiState.update {
+                it.copy(
+                    batchResults = it.batchResults + item,
+                    // Clear per-item error so it doesn't poison the next item's UI.
+                    error = null,
+                    errorLog = null,
+                )
+            }
+            advanceBatch(context)
+        }
+    }
+
+    /**
+     * Move the batch cursor forward. If we're at the end, surface the batch summary
+     * and (if in-place was on) hand the list of originals to MainActivity so it can
+     * fire a single MediaStore.createDeleteRequest dialog for the whole batch.
+     */
+    private fun advanceBatch(context: Context) {
+        val state = _uiState.value
+        if (!state.batchActive) return
+        val nextIndex = state.batchIndex + 1
+        if (nextIndex >= state.batchQueue.size) {
+            // Batch done. Compute the originals that ACTUALLY landed in the gallery —
+            // only delete those. A failed item must never have its source deleted.
+            val deletable = if (state.batchInPlace) {
+                state.batchResults.filter { it.success }.map { it.originalUri }.filter { it != Uri.EMPTY }
+            } else emptyList()
+            _uiState.update {
+                it.copy(
+                    batchIndex = nextIndex,
+                    batchActive = false,
+                    batchComplete = true,
+                    pendingDeleteUris = deletable,
+                )
+            }
+            return
+        }
+        _uiState.update {
+            it.copy(
+                batchIndex = nextIndex,
+                // Keep isCompressing=true through the inter-item gap so the UI doesn't
+                // briefly flash the ResultScreen for the just-finished item. The actual
+                // Transformer is idle for ~50ms while metadata for the next item loads.
+                isCompressing = true,
+                progress = 0f,
+                compressedUri = null,
+                compressedSize = 0L,
+                currentOutputSize = 0L,
+                error = null,
+                errorLog = null,
+                saveSuccess = false,
+                warnings = emptyList(),
+            )
+        }
+        val nextUri = state.batchQueue[nextIndex]
+        loadSelectedUri(context, nextUri, preserveBatchAndPreset = true)
+        // loadSelectedUri runs on IO; give it a moment to populate metadata then start.
+        viewModelScope.launch(Dispatchers.Main) {
+            // Wait for the metadata load to publish a new selectedUri == nextUri.
+            // (Tight poll — we don't want to introduce a state-machine signal for one line.)
+            var attempts = 0
+            while (attempts < 50 && _uiState.value.selectedUri != nextUri) {
+                kotlinx.coroutines.delay(20)
+                attempts++
+            }
+            startCompression(context)
         }
     }
 

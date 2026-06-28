@@ -81,15 +81,31 @@ import kotlinx.coroutines.flow.collect
 class MainActivity : ComponentActivity() {
     private val viewModel by viewModels<CompressorViewModel>()
 
+    private val mediaLocationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* result intentionally ignored — GPS preservation is best-effort */ }
+
     @SuppressLint("SourceLockedOrientationActivity")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
+
         val isTablet = resources.getBoolean(R.bool.is_tablet)
         if (!isTablet) {
             requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         }
-        
+
+        // Request ACCESS_MEDIA_LOCATION once on launch. Without it, MediaStore.setRequireOriginal
+        // throws SecurityException and we fall back to redacted URIs — the picker returns content
+        // with GPS scrubbed, defeating the metadata-preservation feature for any video the user
+        // didn't shoot in-app. If the user denies, the rest of the app still works fine.
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            val granted = checkSelfPermission(android.Manifest.permission.ACCESS_MEDIA_LOCATION) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                mediaLocationPermissionLauncher.launch(android.Manifest.permission.ACCESS_MEDIA_LOCATION)
+            }
+        }
+
         enableEdgeToEdge()
 
         // Handle incoming share intent
@@ -160,15 +176,51 @@ fun CompressorApp(viewModel: CompressorViewModel) {
         }
     }
     
-    val pickMedia = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-        if (uri != null) {
-            viewModel.updateSelectedUri(context, uri)
+    // Up to 30 at once is a hard cap from PickMultipleVisualMedia and is plenty for a phone
+    // archive session — most people batch a handful. Larger asks would also push past
+    // Media3's reasonable per-process resource budget anyway.
+    val pickMediaMulti = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(30)
+    ) { uris ->
+        if (!uris.isNullOrEmpty()) {
+            viewModel.setBatchUris(context, uris)
         }
     }
 
     val createDocumentLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("video/mp4")) { uri ->
         if (uri != null) {
             viewModel.saveToUri(context, uri)
+        }
+    }
+
+    // Fires after the system "Allow this app to delete these videos?" dialog returns.
+    // Whether the user accepted or denied, we clear the queue locally so the UI moves on.
+    val deleteOriginalsLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { _ ->
+        viewModel.consumePendingDeletes()
+    }
+
+    // When the batch finishes with in-place ON, batch-end emits a list of URIs to delete.
+    // We bundle them into one createDeleteRequest so the user gets ONE confirm dialog for
+    // the whole batch instead of one per file.
+    LaunchedEffect(state.pendingDeleteUris) {
+        val urisToDelete = state.pendingDeleteUris
+        if (urisToDelete.isNotEmpty() && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            try {
+                val pendingIntent = android.provider.MediaStore.createDeleteRequest(
+                    context.contentResolver,
+                    urisToDelete
+                )
+                val request = androidx.activity.result.IntentSenderRequest.Builder(pendingIntent.intentSender).build()
+                deleteOriginalsLauncher.launch(request)
+            } catch (e: Exception) {
+                e.printStackTrace()
+                viewModel.consumePendingDeletes()
+            }
+        } else if (urisToDelete.isNotEmpty()) {
+            // API < 30 has no batch delete confirmation API; we just leave the originals alone.
+            viewModel.consumePendingDeletes()
         }
     }
     
@@ -188,8 +240,13 @@ fun CompressorApp(viewModel: CompressorViewModel) {
         }
     }
 
+    // Keep showing CompressingScreen for the whole batch — between items there's a
+    // brief gap where Media3 is idle and isCompressing flips false. Without the
+    // `batchActive` term in the key, Compose would flash the ResultScreen for the
+    // just-finished item before the next one starts.
+    val showCompressing = state.isCompressing || state.batchActive
     AnimatedContent(
-        targetState = state.isCompressing,
+        targetState = showCompressing,
         transitionSpec = {
             if (targetState) {
                 slideInVertically { h -> h } + fadeIn() togetherWith fadeOut()
@@ -225,7 +282,8 @@ fun CompressorApp(viewModel: CompressorViewModel) {
                 Box(modifier = Modifier.padding(innerPadding)) {
                     AnimatedContent(
                         targetState = when {
-                            state.selectedUri == null -> 0
+                            state.selectedUri == null && !state.batchComplete -> 0
+                            state.batchComplete -> 3
                             state.compressedUri != null || state.error != null -> 2
                             else -> 1
                         },
@@ -241,7 +299,7 @@ fun CompressorApp(viewModel: CompressorViewModel) {
                         when(index) {
                             0 -> EmptyScreen(
                                 totalSaved = state.formattedTotalSaved,
-                                onPick = { pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)) }
+                                onPick = { pickMediaMulti.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)) }
                             )
                             2 -> {
                                 if (state.error != null) {
@@ -276,6 +334,7 @@ fun CompressorApp(viewModel: CompressorViewModel) {
                                     )
                                 }
                             }
+                            3 -> BatchSummaryScreen(state = state, onDone = { viewModel.reset() })
                             else -> ConfigScreen(state, viewModel, context)
                         }
                     }
@@ -907,11 +966,12 @@ fun ConfigScreen(
                 Column(
                     modifier = Modifier.fillMaxSize()
                 ) {
-                    Box(
+                    Column(
                         modifier = Modifier
                             .padding(horizontal = 24.dp)
                             .padding(top = 24.dp, bottom = 12.dp)
                     ) {
+                        BatchBanner(state, viewModel)
                         InfoCard(state)
                     }
                     
@@ -1713,12 +1773,36 @@ fun CompressingScreen(
                     modifier = Modifier.padding(24.dp),
                     horizontalAlignment = Alignment.Start
                 ) {
-                    Text(
-                        stringResource(R.string.compressing_video_label),
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontWeight = FontWeight.Bold
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            stringResource(R.string.compressing_video_label),
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontWeight = FontWeight.Bold
+                        )
+                        if (state.isBatch) {
+                            Text(
+                                "${state.batchPosition} / ${state.batchTotal}",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
+                    }
+                    if (state.isBatch && !state.originalName.isNullOrBlank()) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            state.originalName,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        )
+                    }
                     Spacer(modifier = Modifier.height(16.dp))
                     val animatedProgress by animateFloatAsState(
                         targetValue = state.progress,
@@ -1804,5 +1888,164 @@ fun Modifier.expressiveScale(interactionSource: androidx.compose.foundation.inte
     this.graphicsLayer {
         scaleX = scale
         scaleY = scale
+    }
+}
+
+@Composable
+fun BatchBanner(state: CompressorUiState, viewModel: CompressorViewModel) {
+    if (!state.isBatch) return
+    ElevatedCard(
+        modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = MaterialTheme.colorScheme.primaryContainer
+        ),
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                stringResource(R.string.batch_header_title, state.batchTotal),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onPrimaryContainer,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                stringResource(R.string.batch_header_subtitle),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f),
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        stringResource(R.string.batch_inplace_label),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    Text(
+                        stringResource(R.string.batch_inplace_caption),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f),
+                    )
+                }
+                Switch(
+                    checked = state.batchInPlace,
+                    onCheckedChange = { viewModel.setBatchInPlace(it) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun BatchSummaryScreen(state: CompressorUiState, onDone: () -> Unit) {
+    val totalSavedBatch = state.batchResults.sumOf {
+        (it.originalSize - it.finalSize).coerceAtLeast(0L)
+    }
+    val successes = state.batchResults.count { it.success }
+    val failures = state.batchResults.size - successes
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(
+            modifier = Modifier
+                .widthIn(max = 600.dp)
+                .fillMaxSize()
+                .padding(24.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Icon(
+                Icons.Outlined.CheckCircle,
+                contentDescription = null,
+                modifier = Modifier.size(120.dp),
+                tint = MaterialTheme.colorScheme.primary,
+            )
+            Spacer(modifier = Modifier.height(24.dp))
+            Text(
+                stringResource(R.string.batch_summary_title, successes, state.batchTotal),
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                stringResource(R.string.batch_summary_saved, formatFileSize(totalSavedBatch)),
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.Bold,
+            )
+            if (failures > 0) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    stringResource(R.string.batch_summary_failures, failures),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            Spacer(modifier = Modifier.height(24.dp))
+
+            // Per-item breakdown — keep it tight so the screen stays scannable.
+            ElevatedCard(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(20.dp),
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    state.batchResults.forEachIndexed { idx, item ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                if (item.success) Icons.Default.Check else Icons.Outlined.Warning,
+                                contentDescription = null,
+                                tint = if (item.success) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                                modifier = Modifier.size(20.dp),
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    item.originalName ?: "Video ${idx + 1}",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                )
+                                if (item.success) {
+                                    Text(
+                                        "${formatFileSize(item.originalSize)} → ${formatFileSize(item.finalSize)}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                } else if (item.error != null) {
+                                    Text(
+                                        item.error,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.error,
+                                        maxLines = 2,
+                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                    )
+                                }
+                            }
+                        }
+                        if (idx < state.batchResults.lastIndex) {
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(32.dp))
+
+            Button(
+                onClick = onDone,
+                modifier = Modifier.fillMaxWidth().height(56.dp).scaleOnPress(onDone),
+            ) {
+                Text(stringResource(R.string.batch_summary_done))
+            }
+        }
     }
 }
