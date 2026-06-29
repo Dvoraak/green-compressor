@@ -106,7 +106,7 @@ data class CompressorUiState(
     val totalSavedBytes: Long = 0L,
 
     val supportedCodecs: List<String> = emptyList(),
-    val appInfoVersion: String = "2.0.0",
+    val appInfoVersion: String = "2.0.1",
     val showBitrate: Boolean = false,
     val useMbps: Boolean = false,
     val hasShared: Boolean = false,
@@ -2002,14 +2002,42 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 if (c.moveToFirst()) {
                     val path = c.getString(0)
                     val name = c.getString(1)
-                    if (path.isNullOrBlank() || name.isNullOrBlank()) null
-                    else Triple(msUri, path, name)
+                    when {
+                        path.isNullOrBlank() || name.isNullOrBlank() -> null
+                        !isAllowedVideoRelativePath(path) -> {
+                            // MediaStore.Video.Media's content provider rejects inserts whose
+                            // RELATIVE_PATH isn't under DCIM/, Movies/, or Pictures/ — videos
+                            // sitting in Download/, Recordings/, app-specific folders, etc.
+                            // would otherwise crash the save with "Primary directory X not
+                            // allowed". Returning null here drops the in-place attempt; the
+                            // caller falls back to saving in Movies/Compressor while still
+                            // queuing the original for the delete dialog. Result: not
+                            // seamless (the file moves to Movies/Compressor instead of
+                            // replacing in place), but the original IS still deleted on
+                            // confirm.
+                            android.util.Log.i(
+                                TAG,
+                                "Source RELATIVE_PATH='$path' isn't a permitted Video folder; " +
+                                    "falling back to Movies/Compressor for in-place save"
+                            )
+                            null
+                        }
+                        else -> Triple(msUri, path, name)
+                    }
                 } else null
             }
         } catch (e: Exception) {
             android.util.Log.w(TAG, "resolveOriginalLocation query failed for $sourceUri", e)
             null
         }
+    }
+
+    private fun isAllowedVideoRelativePath(path: String): Boolean {
+        // Mirror the platform validation in MediaProvider.java: top-level dir
+        // must be one of {DCIM, Movies, Pictures}. Subdirectories under those
+        // are fine.
+        val firstSegment = path.trimEnd('/').substringBefore('/').lowercase()
+        return firstSegment == "dcim" || firstSegment == "movies" || firstSegment == "pictures"
     }
 
     /**

@@ -112,6 +112,12 @@ git tag v2.0.1 && git push origin v2.0.1
   to date-only patching rather than corrupting mdat offsets.
 - **In-place delete** uses `MediaStore.createDeleteRequest` (API 30+). On
   Android 10 the request silently no-ops — fine for the Pixel target.
+- **Seamless replace only works for videos in DCIM/, Movies/, or
+  Pictures/.** `MediaStore.Video.Media` rejects inserts targeting other
+  top-level folders (Download/, Recordings/, app-specific dirs). For those
+  sources the compressed copy lands in `Movies/Compressor/<name>_Compressed.mp4`
+  instead, but the original-delete dialog still fires — so the user gets
+  the compressed file and the original is removed, just not "in place".
 
 ## License & credits
 
