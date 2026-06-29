@@ -2132,6 +2132,26 @@ fun BatchSummaryScreen(state: CompressorUiState, onDone: () -> Unit) {
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
+                                    // Surface WHERE the compressed copy landed when the user
+                                    // wanted in-place: green for "replaced in original folder",
+                                    // amber for "fell back to Movies/Compressor because the
+                                    // source folder (Download/, WhatsApp/, etc.) isn't an
+                                    // allowed video folder per Android MediaProvider".
+                                    if (state.batchInPlace) {
+                                        if (item.inPlaceReplaced) {
+                                            Text(
+                                                stringResource(R.string.batch_summary_replaced_in_place),
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.primary,
+                                            )
+                                        } else {
+                                            Text(
+                                                stringResource(R.string.batch_summary_fallback_movies),
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.tertiary,
+                                            )
+                                        }
+                                    }
                                 } else if (item.error != null) {
                                     Text(
                                         item.error,

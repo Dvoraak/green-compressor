@@ -130,6 +130,8 @@
     <string name="batch_summary_saved">Saved %1$s</string>
     <string name="batch_summary_failures">%1$d failed</string>
     <string name="batch_summary_done">Done</string>
+    <string name="batch_summary_replaced_in_place">Replaced in original folder</string>
+    <string name="batch_summary_fallback_movies">Saved to Movies/Compressor (source folder doesn\'t allow in-place replace)</string>
     <string name="attribution_upstream">Based on Compressor by JoshAtticus (MIT)</string>
 
     <!-- Foreground service notification -->

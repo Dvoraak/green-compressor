@@ -52,6 +52,16 @@ data class BatchItemResult(
     val finalSize: Long,
     val success: Boolean,
     val error: String? = null,
+    /**
+     * True when the user opted into in-place replacement AND the source's
+     * folder is one MediaStore accepts for Video inserts (DCIM/, Movies/,
+     * Pictures/). False when the user opted in but the source was in
+     * Download/, Android/media/<pkg>/, WhatsApp/Media/, etc., so the
+     * compressed copy was saved to Movies/Compressor instead — the
+     * original is still queued for deletion in that case, but the user
+     * sees the new file under a different folder than before.
+     */
+    val inPlaceReplaced: Boolean = false,
 )
 
 /**
@@ -106,7 +116,7 @@ data class CompressorUiState(
     val totalSavedBytes: Long = 0L,
 
     val supportedCodecs: List<String> = emptyList(),
-    val appInfoVersion: String = "2.0.1",
+    val appInfoVersion: String = "2.0.2",
     val showBitrate: Boolean = false,
     val useMbps: Boolean = false,
     val hasShared: Boolean = false,
@@ -2095,6 +2105,14 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             val before = _uiState.value
             val saved = saveToGalleryBlocking(context)
             val after = _uiState.value
+            // If pendingFinalizations grew during the save, this item is queued
+            // for the seamless in-place rename when the user confirms the delete
+            // dialog. If it didn't grow, saveToGalleryBlocking fell back to
+            // Movies/Compressor (source folder isn't one MediaStore accepts for
+            // Video inserts) — useful to surface on the BatchSummary so the user
+            // knows where each compressed copy actually landed.
+            val finalizationsAdded =
+                after.pendingFinalizations.size > before.pendingFinalizations.size
             val item = BatchItemResult(
                 originalUri = before.selectedUri ?: Uri.EMPTY,
                 originalName = before.originalName,
@@ -2102,6 +2120,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 finalSize = after.compressedSize,
                 success = saved,
                 error = if (!saved) after.error else null,
+                inPlaceReplaced = saved && finalizationsAdded,
             )
             // Drop the per-item cache file once it's safely copied into MediaStore. A 30-item
             // batch of 200 MB videos would otherwise hoard up to ~3 GB of cache before the
