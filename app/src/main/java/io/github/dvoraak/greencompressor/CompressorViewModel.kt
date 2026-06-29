@@ -54,6 +54,19 @@ data class BatchItemResult(
     val error: String? = null,
 )
 
+/**
+ * One pending in-place save that's been written to MediaStore with IS_PENDING=1
+ * at its target folder but a temp DISPLAY_NAME, waiting for the
+ * createDeleteRequest dialog result. On confirm we atomically reveal it under
+ * [desiredFinalName]; on deny we move it to Movies/Compressor with the
+ * non-destructive [fallbackName] so the user still has the compressed copy.
+ */
+data class FinalizationTarget(
+    val savedUri: Uri,
+    val desiredFinalName: String,
+    val fallbackName: String,
+)
+
 // All sorted so nicely :D
 data class CompressorUiState(
     val selectedUri: Uri? = null,
@@ -80,8 +93,10 @@ data class CompressorUiState(
     val errorLog: String? = null,
     val saveSuccess: Boolean = false,
 
-    // Configuration
-    val activePreset: QualityPreset = QualityPreset.HIGH,
+    // Configuration. Defaults skew toward the archive workflow this fork is built
+    // for: LOW preset (smallest reasonable file) + in-place replacement of the
+    // original. Users can flip either back on any item before tapping Start.
+    val activePreset: QualityPreset = QualityPreset.LOW,
     val targetSizeMb: Float = 10f,
     val useH265: Boolean = true,
     val videoCodec: String = MimeTypes.VIDEO_H265,
@@ -91,7 +106,7 @@ data class CompressorUiState(
     val totalSavedBytes: Long = 0L,
 
     val supportedCodecs: List<String> = emptyList(),
-    val appInfoVersion: String = "1.0.2",
+    val appInfoVersion: String = "1.0.0",
     val showBitrate: Boolean = false,
     val useMbps: Boolean = false,
     val hasShared: Boolean = false,
@@ -104,9 +119,10 @@ data class CompressorUiState(
     val batchQueue: List<Uri> = emptyList(),
     val batchIndex: Int = 0,
     val batchResults: List<BatchItemResult> = emptyList(),
-    val batchInPlace: Boolean = false,
+    val batchInPlace: Boolean = true,
     val batchActive: Boolean = false,
     val pendingDeleteUris: List<Uri> = emptyList(),
+    val pendingFinalizations: List<FinalizationTarget> = emptyList(),
     val batchComplete: Boolean = false,
 ) {
     val isBatch: Boolean get() = batchQueue.size > 1
@@ -383,12 +399,81 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         val showBitrate = prefs.getBoolean("show_bitrate", false)
         val useMbps = prefs.getBoolean("use_mbps", false)
         _uiState.update { it.copy(
-            totalSavedBytes = saved, 
-            showBitrate = showBitrate, 
+            totalSavedBytes = saved,
+            showBitrate = showBitrate,
             useMbps = useMbps
         ) }
         checkSupportedCodecs()
         clearCache()
+        recoverOrphanedPending()
+    }
+
+    /**
+     * Scan for in-place compressed copies stranded with IS_PENDING=1 by an
+     * earlier crashed/buggy batch run, and surface them. They're invisible to
+     * galleries because of the pending flag; the user thinks their compressed
+     * copies were "deleted" when actually they're sitting on disk with our
+     * temp `.gc_pending_*` prefix.
+     *
+     * The recovery action is non-destructive: flip IS_PENDING=0, move to
+     * Movies/Compressor, and rename to a sensible `Recovered_<timestamp>.mp4`.
+     * The user can rename further themselves; better that than the file
+     * staying invisible until Android auto-purges it a week later.
+     */
+    private fun recoverOrphanedPending() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val context = getApplication<Application>()
+                val args = android.os.Bundle().apply {
+                    putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE)
+                    putString(
+                        android.content.ContentResolver.QUERY_ARG_SQL_SELECTION,
+                        "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?"
+                    )
+                    putStringArray(
+                        android.content.ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS,
+                        arrayOf(".gc_pending_%"),
+                    )
+                }
+                val collection = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                context.contentResolver.query(
+                    collection,
+                    arrayOf(MediaStore.Video.Media._ID, MediaStore.Video.Media.DISPLAY_NAME),
+                    args,
+                    null,
+                )?.use { c ->
+                    var recovered = 0
+                    while (c.moveToNext()) {
+                        val id = c.getLong(0)
+                        val tmpName = c.getString(1) ?: ".gc_pending_unknown.mp4"
+                        val uri = android.content.ContentUris.withAppendedId(collection, id)
+                        try {
+                            val values = ContentValues().apply {
+                                put(MediaStore.MediaColumns.IS_PENDING, 0)
+                                put(
+                                    MediaStore.MediaColumns.DISPLAY_NAME,
+                                    "Recovered_${System.currentTimeMillis()}_${tmpName.removePrefix(".")}",
+                                )
+                                put(
+                                    MediaStore.MediaColumns.RELATIVE_PATH,
+                                    Environment.DIRECTORY_MOVIES + "/Compressor",
+                                )
+                            }
+                            context.contentResolver.update(uri, values, null, null)
+                            recovered++
+                        } catch (e: Exception) {
+                            android.util.Log.w(TAG, "Recover failed for $uri", e)
+                        }
+                    }
+                    if (recovered > 0) {
+                        android.util.Log.i(TAG, "Recovered $recovered orphan pending files into Movies/Compressor")
+                    }
+                }
+            } catch (e: Exception) {
+                android.util.Log.w(TAG, "recoverOrphanedPending scan failed", e)
+            }
+        }
     }
     
     private fun checkSupportedCodecs() {
@@ -459,7 +544,10 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
 
             val carry = _uiState.value
             val keepBatch = preserveBatchAndPreset && carry.batchActive
-            val activePreset = if (preserveBatchAndPreset) carry.activePreset else QualityPreset.HIGH
+            // Default new picks to the LOW archive preset; preserve the user's
+            // current choice during batch advance so the same preset applies
+            // across the queue.
+            val activePreset = if (preserveBatchAndPreset) carry.activePreset else QualityPreset.LOW
 
             val next = CompressorUiState(
                 selectedUri = uri,
@@ -487,18 +575,30 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 batchQueue = if (keepBatch) carry.batchQueue else emptyList(),
                 batchIndex = if (keepBatch) carry.batchIndex else 0,
                 batchResults = if (keepBatch) carry.batchResults else emptyList(),
-                batchInPlace = if (keepBatch) carry.batchInPlace else false,
+                // New picks inherit the global default (in-place ON); batch advance
+                // preserves whatever the user toggled at the start of the batch.
+                batchInPlace = if (keepBatch) carry.batchInPlace else true,
                 batchActive = keepBatch,
+                // CRITICAL: in-place pending finalizations accumulate across the
+                // whole batch. Forgetting to carry them here meant each new item
+                // wiped the list, only the last item got renamed after the delete
+                // dialog, and items 1..N-1 stayed IS_PENDING=1 forever while
+                // their originals were already deleted by the system — silent
+                // data loss.
+                pendingFinalizations = if (keepBatch) carry.pendingFinalizations else emptyList(),
                 // Preserve in-flight compressing flag — advanceBatch sets isCompressing=true
                 // BEFORE calling loadSelectedUri so the UI doesn't flash ConfigScreen between
                 // items. Constructing a fresh state object would otherwise reset it to false.
                 isCompressing = keepBatch && carry.isCompressing,
             ).autoAdjust(defaultTargetMb)
 
-            // Re-apply preset against the new item's resolution so all batch items
-            // get the same quality bucket (HIGH/MEDIUM/LOW) recomputed per video.
+            // Re-apply the preset against this item's own resolution so the LOW/MEDIUM/HIGH
+            // bucket's targets (height, fps, audio bitrate, size) actually take effect — the
+            // initial state has only the *label* of the preset, not its parameters. We do
+            // this for every load, not just batch-advance, so the default LOW preset
+            // applies to a fresh single-video pick too.
             _uiState.value = next
-            if (preserveBatchAndPreset && activePreset != QualityPreset.CUSTOM) {
+            if (activePreset != QualityPreset.CUSTOM) {
                 applyPreset(activePreset)
             }
         }
@@ -552,8 +652,29 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 uri
             }
 
+            // FD-based setDataSource. Android 14+'s photo picker hands out
+            // content://media/picker/... URIs that MediaMetadataRetriever's
+            // (Context, Uri) overload silently fails to read — every extractor
+            // call returns null, leaving the app with 0x0 dimensions and no
+            // GPS / date. Opening the URI as a ParcelFileDescriptor first and
+            // handing the raw FD to the retriever bypasses that whole code
+            // path and works on every URI type we care about (picker, gallery
+            // MediaStore, SAF).
             val retriever = android.media.MediaMetadataRetriever()
-            retriever.setDataSource(context, sourceUriForReading)
+            val pfd = try {
+                context.contentResolver.openFileDescriptor(sourceUriForReading, "r")
+                    ?: context.contentResolver.openFileDescriptor(uri, "r")
+            } catch (_: Exception) {
+                context.contentResolver.openFileDescriptor(uri, "r")
+            }
+            pfd?.use { fd ->
+                try {
+                    retriever.setDataSource(fd.fileDescriptor)
+                } catch (e: Exception) {
+                    android.util.Log.w(TAG, "retriever.setDataSource(fd) failed, falling back to URI", e)
+                    retriever.setDataSource(context, sourceUriForReading)
+                }
+            } ?: retriever.setDataSource(context, sourceUriForReading)
 
             width = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
             height = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
@@ -583,6 +704,11 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             if (!containerDate.isNullOrBlank()) {
                 dateTakenMs = parseContainerDate(containerDate)
             }
+            android.util.Log.i(
+                TAG,
+                "metadata uri=$uri width=$width height=$height duration=${duration}ms fps=$fps " +
+                    "mime=$videoMime bitrate=$bitrate dateMs=$dateTakenMs hasLoc=${location != null}"
+            )
 
             val cursor = context.contentResolver.query(
                 uri,
@@ -599,7 +725,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                         if (nameIndex >= 0) originalName = cursor.getString(nameIndex)
                         val dtIdx = cursor.getColumnIndex(MediaStore.Video.Media.DATE_TAKEN)
                         if (dtIdx >= 0 && !cursor.isNull(dtIdx)) {
-                            val ms = cursor.getLong(dtIdx)
+                            val ms = sanityCheckDate(cursor.getLong(dtIdx))
                             // MediaStore reports DATE_TAKEN as ms-since-epoch; prefer it over container date
                             if (ms > 0) dateTakenMs = ms
                         }
@@ -641,12 +767,28 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             try {
                 val sdf = java.text.SimpleDateFormat(p, java.util.Locale.US)
                 sdf.timeZone = java.util.TimeZone.getTimeZone("UTC")
+                // Strict — lenient mode happily ingests garbage like "T142233Z" and
+                // defaults the year to 1970, producing the "year 1970, time correct"
+                // archive bug. Force exact-pattern matches only.
+                sdf.isLenient = false
                 val d = sdf.parse(raw) ?: continue
-                return d.time
+                return sanityCheckDate(d.time)
             } catch (_: Exception) {
             }
         }
         return 0L
+    }
+
+    /**
+     * Reject obviously-bogus timestamps. Real archive footage from any
+     * smartphone-era device is post-2000; anything older is almost
+     * certainly the encoder's "no date set" sentinel (often the Unix epoch
+     * or a few days into 1970) and would land the saved copy at the top
+     * of a 1970 stack in Google Photos.
+     */
+    private fun sanityCheckDate(ms: Long): Long {
+        val year2000 = 946_684_800_000L
+        return if (ms < year2000) 0L else ms
     }
 
     /** Multi-pick entry point. Loads the first item; rest stay queued for after compression. */
@@ -676,7 +818,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 originalLocation = meta.location,
                 targetSizeMb = defaultTargetMb,
                 targetResolutionHeight = meta.height,
-                activePreset = QualityPreset.HIGH,
+                activePreset = QualityPreset.LOW,
                 totalSavedBytes = carry.totalSavedBytes,
                 showBitrate = carry.showBitrate,
                 useMbps = carry.useMbps,
@@ -685,8 +827,19 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 useH265 = carry.useH265,
                 batchQueue = uris,
                 batchIndex = 0,
-                batchActive = true,
+                // CRITICAL: batchActive must stay false here. It marks "a batch is
+                // actively running", not "a batch is queued". If it's true at this
+                // point, MainActivity's `showCompressing = isCompressing || batchActive`
+                // routes the user straight to CompressingScreen, bypassing the
+                // ConfigScreen entirely — they can never reach the preset / in-place
+                // toggles. startCompression() flips this true when the user actually
+                // taps Start.
+                batchActive = false,
             ).autoAdjust(defaultTargetMb)
+            // Apply the LOW preset's actual parameters now that originalWidth/Height
+            // are known — without this, the state has activePreset=LOW but
+            // targetResolutionHeight is still the source resolution.
+            applyPreset(QualityPreset.LOW)
         }
     }
 
@@ -696,6 +849,154 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
 
     fun consumePendingDeletes() {
         _uiState.update { it.copy(pendingDeleteUris = emptyList()) }
+    }
+
+    /**
+     * Convert whatever-URI-the-source-came-in-as into a URI that
+     * [MediaStore.createDeleteRequest] can act on (must live under the
+     * `media` authority, e.g. content://media/external/video/media/123).
+     *
+     * Three input shapes show up in practice:
+     *
+     *  1. **Photo-picker URI** (content://media/picker/...). On Android 14+,
+     *     [MediaStore.getMediaUri] throws "Provider for this Uri is not
+     *     supported" because the picker may include cloud-backed items. The
+     *     stable workaround is to query the picker URI for the
+     *     `media_store_uri` column ([MediaStore.PickerMediaColumns.MEDIA_STORE_URI]).
+     *
+     *  2. **Google Photos share URI** (content://com.google.android.apps.
+     *     photos.contentprovider/-1/2/<encoded inner URI>/REQUIRE_ORIGINAL/...).
+     *     The inner MediaStore URI is URL-encoded inside one of the path
+     *     segments. Decode-and-walk to find it.
+     *
+     *  3. **Direct MediaStore URI** (content://media/external/video/media/N).
+     *     Pass through unchanged.
+     */
+    private fun resolveDeletableUri(context: Context, uri: Uri): Uri? {
+        if (uri == Uri.EMPTY) return null
+        val auth = uri.authority ?: return null
+        return try {
+            // Strategy: try the *cheapest* known shape first (already a
+            // MediaStore URI), then any provider-specific embedded form
+            // (Google Photos URL-encodes the MediaStore URI inside its
+            // path), then fall back to the generic size+duration MediaStore
+            // lookup that works for the photo picker, Files Go, and any
+            // other share-from provider that exposes OpenableColumns.
+            when {
+                auth == MediaStore.AUTHORITY && !uri.toString().contains("/picker/") -> uri
+                auth == "com.google.android.apps.photos.contentprovider" ->
+                    resolveGooglePhotosUri(uri) ?: resolveBySizeAndDuration(context, uri)
+                else -> resolveBySizeAndDuration(context, uri)
+            }
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "resolveDeletableUri failed for $uri", e)
+            null
+        }
+    }
+
+    private fun resolveBySizeAndDuration(context: Context, uri: Uri): Uri? {
+        // Generic fallback for any content URI that hides the underlying
+        // MediaStore row but exposes OpenableColumns. Used by:
+        //   - The Android 14+ photo picker (`content://media/picker/...`),
+        //     which firewalls `getMediaUri` and reports DISPLAY_NAME as its
+        //     internal id rather than the real filename.
+        //   - Google Files (`content://com.google.android.apps.nbu.files.provider/...`),
+        //     whose URIs aren't directly deletable.
+        //   - Anything else that hands us a wrapping content URI rather
+        //     than a real MediaStore one.
+        //
+        // SIZE alone collides on duplicate-byte-count files; combined with
+        // DURATION (ms) the tuple is unique enough for any real video
+        // library (two videos that are exactly the same byte size AND the
+        // same millisecond duration are effectively the same video). We
+        // hold READ_MEDIA_VIDEO at runtime so the lookup against
+        // MediaStore.Video.Media succeeds.
+        var sizeBytes: Long = -1L
+        var durationMs: Long = -1L
+        try {
+            context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val sIdx = c.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                    if (sIdx >= 0 && !c.isNull(sIdx)) sizeBytes = c.getLong(sIdx)
+                    // Picker exposes duration as "duration" (raw) or via
+                    // PickerMediaColumns.DURATION_MILLIS — try both names.
+                    for (col in arrayOf("duration_millis", "duration")) {
+                        val di = c.getColumnIndex(col)
+                        if (di >= 0 && !c.isNull(di)) {
+                            durationMs = c.getLong(di)
+                            break
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "Picker URI metadata query failed: $uri", e)
+        }
+        if (sizeBytes <= 0) {
+            android.util.Log.w(TAG, "Picker URI exposed no SIZE: $uri")
+            return null
+        }
+
+        // Build the lookup. DURATION is in ms in MediaStore.Video.Media.DURATION.
+        // If we couldn't get a picker duration, fall back to SIZE alone.
+        val sel: String
+        val args: Array<String>
+        if (durationMs > 0) {
+            sel = "${MediaStore.MediaColumns.SIZE} = ? AND ${MediaStore.Video.Media.DURATION} = ?"
+            args = arrayOf(sizeBytes.toString(), durationMs.toString())
+        } else {
+            sel = "${MediaStore.MediaColumns.SIZE} = ?"
+            args = arrayOf(sizeBytes.toString())
+        }
+
+        try {
+            context.contentResolver.query(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                arrayOf(MediaStore.Video.Media._ID, MediaStore.MediaColumns.DISPLAY_NAME),
+                sel, args, null,
+            )?.use { c ->
+                val matches = mutableListOf<Pair<Long, String?>>()
+                while (c.moveToNext()) {
+                    matches.add(c.getLong(0) to c.getString(1))
+                }
+                if (matches.isEmpty()) {
+                    android.util.Log.w(TAG, "No MediaStore match: size=$sizeBytes durationMs=$durationMs uri=$uri")
+                    return null
+                }
+                if (matches.size > 1) {
+                    android.util.Log.w(
+                        TAG,
+                        "Multiple MediaStore rows match size=$sizeBytes durationMs=$durationMs: " +
+                            matches.joinToString { "${it.first}:${it.second}" } +
+                            " — picking first (the system delete dialog will let user verify)"
+                    )
+                }
+                val (id, name) = matches.first()
+                val resolved = android.content.ContentUris.withAppendedId(
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id
+                )
+                android.util.Log.i(TAG, "Picker→MediaStore via size+duration: $uri → $resolved ($name)")
+                return resolved
+            }
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "MediaStore size+duration lookup failed for $uri", e)
+        }
+        return null
+    }
+
+    private fun resolveGooglePhotosUri(uri: Uri): Uri? {
+        // Walk the path segments, URL-decoding each, until one starts with
+        // content://media/external/ — that's the MediaStore URI Photos wrapped.
+        for (seg in uri.pathSegments) {
+            val decoded = Uri.decode(seg) ?: continue
+            if (decoded.startsWith("content://media/external/")) {
+                val resolved = Uri.parse(decoded)
+                android.util.Log.i(TAG, "Photos→MediaStore: $uri → $resolved")
+                return resolved
+            }
+        }
+        android.util.Log.w(TAG, "Google Photos URI has no embedded MediaStore URI: $uri")
+        return null
     }
     
     fun markAsShared() {
@@ -932,6 +1233,10 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         _uiState.update {
             it.copy(
                 isCompressing = true,
+                // Mark batch as actively running NOW (not when the queue was set up).
+                // This is what keeps CompressingScreen visible across the inter-item
+                // gap once the user has explicitly chosen to start.
+                batchActive = it.batchQueue.size > 1,
                 progress = 0f,
                 currentOutputSize = 0L,
                 error = null,
@@ -1244,10 +1549,34 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    private fun getAudioBitrate(context: Context, uri: Uri): Int {
+    private fun openExtractor(context: Context, uri: Uri): Pair<MediaExtractor, android.os.ParcelFileDescriptor?>? {
+        // Same reason as the retriever fix in readSourceMetadata: photo-picker URIs
+        // on Android 14+ have to be opened via FD or MediaExtractor silently
+        // returns trackCount=0. The ParcelFileDescriptor must outlive the extractor,
+        // so we hand it back to the caller to close after release().
         val extractor = MediaExtractor()
         try {
+            val pfd = context.contentResolver.openFileDescriptor(uri, "r")
+            if (pfd != null) {
+                extractor.setDataSource(pfd.fileDescriptor)
+                return extractor to pfd
+            }
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "openExtractor FD path failed for $uri, falling back", e)
+        }
+        return try {
             extractor.setDataSource(context, uri, null)
+            extractor to null
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "openExtractor URI fallback also failed for $uri", e)
+            extractor.release()
+            null
+        }
+    }
+
+    private fun getAudioBitrate(context: Context, uri: Uri): Int {
+        val (extractor, pfd) = openExtractor(context, uri) ?: return 0
+        try {
             for (i in 0 until extractor.trackCount) {
                 val format = extractor.getTrackFormat(i)
                 val mime = format.getString(MediaFormat.KEY_MIME)
@@ -1261,14 +1590,14 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             e.printStackTrace()
         } finally {
             extractor.release()
+            pfd?.close()
         }
         return 0
     }
 
     private fun getVideoTrackInfo(context: Context, uri: Uri): VideoTrackInfo? {
-        val extractor = MediaExtractor()
+        val (extractor, pfd) = openExtractor(context, uri) ?: return null
         try {
-            extractor.setDataSource(context, uri, null)
             for (i in 0 until extractor.trackCount) {
                 val format = extractor.getTrackFormat(i)
                 val mime = format.getString(MediaFormat.KEY_MIME)
@@ -1292,6 +1621,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             e.printStackTrace()
         } finally {
             extractor.release()
+            pfd?.close()
         }
         return null
     }
@@ -1483,7 +1813,19 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
 
     fun saveToGallery(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
-            saveToGalleryBlocking(context)
+            val before = _uiState.value
+            val ok = saveToGalleryBlocking(context)
+            if (ok && before.batchInPlace && !before.isBatch) {
+                // Mono-video path: the batch advance machinery never runs, so wire the
+                // in-place delete request here. We do it AFTER the save succeeds so a
+                // failed save can never wipe the source.
+                val src = before.selectedUri
+                val toDelete = if (src != null) listOfNotNull(resolveDeletableUri(context, src)) else emptyList()
+                android.util.Log.i(TAG, "Mono in-place: src=$src deletable=${toDelete.size}")
+                if (toDelete.isNotEmpty()) {
+                    _uiState.update { it.copy(pendingDeleteUris = toDelete) }
+                }
+            }
         }
     }
 
@@ -1497,32 +1839,47 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 return@withContext false
             }
 
-            val targetName = if (currentState.originalName != null) {
-                val nameWithoutExt = currentState.originalName.substringBeforeLast(".")
-                "${nameWithoutExt}_Compressed.mp4"
+            // If the user toggled "Replace originals" AND the source resolves to a real
+            // MediaStore item we can read RELATIVE_PATH + DISPLAY_NAME from, we save into
+            // the SAME folder under a temp DISPLAY_NAME with IS_PENDING=1. The file is
+            // invisible to galleries until finalizeInPlace renames it after the delete
+            // dialog returns. Otherwise we fall back to the original Movies/Compressor
+            // flow with the _Compressed suffix.
+            val inPlaceTarget: Triple<Uri, String, String>? =
+                if (currentState.batchInPlace &&
+                    currentState.selectedUri != null &&
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    resolveOriginalLocation(context, currentState.selectedUri)
+                } else null
+
+            val (relativePath, displayName, finalize) = if (inPlaceTarget != null) {
+                val (_, origPath, _) = inPlaceTarget
+                val tmpName = ".gc_pending_${System.nanoTime()}_${java.util.UUID.randomUUID().toString().take(8)}.mp4"
+                Triple(origPath, tmpName, true)
             } else {
-                "Compressed_${System.currentTimeMillis()}.mp4"
+                val targetName = if (currentState.originalName != null) {
+                    val nameWithoutExt = currentState.originalName.substringBeforeLast(".")
+                    "${nameWithoutExt}_Compressed.mp4"
+                } else {
+                    "Compressed_${System.currentTimeMillis()}.mp4"
+                }
+                Triple(Environment.DIRECTORY_MOVIES + "/Compressor", targetName, false)
             }
 
             // Source DATE_TAKEN drives chronological ordering in Google Photos / gallery apps.
-            // Without it, every archive copy lands at the top of the timeline ("just added"),
-            // which is the original bug that motivated this fork.
-            val dateTakenForStore = if (currentState.originalDateTakenMs > 0) {
-                currentState.originalDateTakenMs
-            } else 0L
+            val dateTakenForStore = if (currentState.originalDateTakenMs > 0) currentState.originalDateTakenMs else 0L
 
             val values = ContentValues().apply {
-                put(MediaStore.Video.Media.DISPLAY_NAME, targetName)
+                put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
                 put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
                 put(MediaStore.Video.Media.DATE_ADDED, System.currentTimeMillis() / 1000)
                 put(MediaStore.Video.Media.DATE_MODIFIED, System.currentTimeMillis() / 1000)
                 if (dateTakenForStore > 0) {
                     put(MediaStore.Video.Media.DATE_TAKEN, dateTakenForStore)
                 }
-
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     put(MediaStore.Video.Media.IS_PENDING, 1)
-                    put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/Compressor")
+                    put(MediaStore.Video.Media.RELATIVE_PATH, relativePath)
                 }
             }
 
@@ -1541,13 +1898,29 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                     }
                 }
 
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    values.clear()
-                    values.put(MediaStore.Video.Media.IS_PENDING, 0)
-                    context.contentResolver.update(itemUri, values, null, null)
+                if (finalize && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    // Don't clear IS_PENDING yet — finalizeInPlace will do that atomically
+                    // with the DISPLAY_NAME rename after the delete dialog returns.
+                    val desiredName = inPlaceTarget!!.third
+                    val nameWithoutExt = desiredName.substringBeforeLast(".")
+                    val ext = if (desiredName.contains('.')) desiredName.substringAfterLast('.') else "mp4"
+                    val fallback = "${nameWithoutExt}_Compressed.$ext"
+                    _uiState.update {
+                        it.copy(
+                            pendingFinalizations = it.pendingFinalizations +
+                                FinalizationTarget(itemUri, desiredName, fallback),
+                            saveSuccess = true,
+                        )
+                    }
+                    android.util.Log.i(TAG, "In-place pending: $itemUri tmpName=$displayName desired=$desiredName")
+                } else {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        values.clear()
+                        values.put(MediaStore.Video.Media.IS_PENDING, 0)
+                        context.contentResolver.update(itemUri, values, null, null)
+                    }
+                    _uiState.update { it.copy(saveSuccess = true) }
                 }
-
-                _uiState.update { it.copy(saveSuccess = true) }
                 return@withContext true
             } else {
                 _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_gallery_entry)) }
@@ -1557,6 +1930,84 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             e.printStackTrace()
             _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_save_failed, e.message)) }
             return@withContext false
+        }
+    }
+
+    /**
+     * Walks back from any source URI to its MediaStore row and returns
+     * (mediaStoreUri, relativePath, displayName) — used to know WHERE to save
+     * the compressed copy if the user wants seamless in-place replacement.
+     * Returns null when we can't resolve (cloud item, exotic provider, no
+     * READ_MEDIA_VIDEO grant, pre-Q device) — caller falls back to the
+     * standard Movies/Compressor save in that case.
+     */
+    private fun resolveOriginalLocation(context: Context, sourceUri: Uri): Triple<Uri, String, String>? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+        val msUri = resolveDeletableUri(context, sourceUri) ?: return null
+        return try {
+            context.contentResolver.query(
+                msUri,
+                arrayOf(
+                    MediaStore.MediaColumns.RELATIVE_PATH,
+                    MediaStore.MediaColumns.DISPLAY_NAME,
+                ),
+                null, null, null,
+            )?.use { c ->
+                if (c.moveToFirst()) {
+                    val path = c.getString(0)
+                    val name = c.getString(1)
+                    if (path.isNullOrBlank() || name.isNullOrBlank()) null
+                    else Triple(msUri, path, name)
+                } else null
+            }
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "resolveOriginalLocation query failed for $sourceUri", e)
+            null
+        }
+    }
+
+    /**
+     * Called from the deleteOriginalsLauncher result. If [confirmed] is true,
+     * the system has already removed the originals — flip each in-place
+     * pending save from its temp DISPLAY_NAME to the original's DISPLAY_NAME
+     * (atomically clearing IS_PENDING). If [confirmed] is false, the user
+     * denied; move each pending save into Movies/Compressor with the
+     * non-destructive _Compressed suffix so they still get the compressed
+     * copy somewhere reasonable.
+     */
+    fun finalizeInPlace(context: Context, confirmed: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val targets = _uiState.value.pendingFinalizations
+            android.util.Log.i(TAG, "finalizeInPlace confirmed=$confirmed targets=${targets.size}")
+            for (t in targets) {
+                try {
+                    val values = ContentValues().apply {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            put(MediaStore.MediaColumns.IS_PENDING, 0)
+                        }
+                        if (confirmed) {
+                            put(MediaStore.MediaColumns.DISPLAY_NAME, t.desiredFinalName)
+                        } else {
+                            put(MediaStore.MediaColumns.DISPLAY_NAME, t.fallbackName)
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                put(
+                                    MediaStore.MediaColumns.RELATIVE_PATH,
+                                    Environment.DIRECTORY_MOVIES + "/Compressor",
+                                )
+                            }
+                        }
+                    }
+                    val rows = context.contentResolver.update(t.savedUri, values, null, null)
+                    android.util.Log.i(
+                        TAG,
+                        "Finalize ${t.savedUri} confirmed=$confirmed rows=$rows " +
+                            "→ ${if (confirmed) t.desiredFinalName else t.fallbackName}"
+                    )
+                } catch (e: Exception) {
+                    android.util.Log.w(TAG, "Finalize update failed for ${t.savedUri}", e)
+                }
+            }
+            _uiState.update { it.copy(pendingFinalizations = emptyList(), pendingDeleteUris = emptyList()) }
         }
     }
 
@@ -1613,9 +2064,22 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         if (nextIndex >= state.batchQueue.size) {
             // Batch done. Compute the originals that ACTUALLY landed in the gallery —
             // only delete those. A failed item must never have its source deleted.
+            // Picker URIs are content://media/picker/...; createDeleteRequest only
+            // accepts content://media/external/video/...  — so resolve each one
+            // through MediaStore.getMediaUri (requires READ_MEDIA_VIDEO, which we
+            // request at activity start). If the conversion fails for any reason,
+            // we just skip that item rather than failing the whole dialog.
             val deletable = if (state.batchInPlace) {
-                state.batchResults.filter { it.success }.map { it.originalUri }.filter { it != Uri.EMPTY }
+                state.batchResults
+                    .filter { it.success }
+                    .mapNotNull { resolveDeletableUri(context, it.originalUri) }
             } else emptyList()
+            android.util.Log.i(
+                TAG,
+                "Batch complete. successes=${state.batchResults.count { it.success }} " +
+                    "failures=${state.batchResults.count { !it.success }} " +
+                    "inPlace=${state.batchInPlace} deletable=${deletable.size}"
+            )
             _uiState.update {
                 it.copy(
                     batchIndex = nextIndex,

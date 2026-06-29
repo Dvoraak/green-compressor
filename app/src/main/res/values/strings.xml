@@ -122,6 +122,10 @@
     <string name="batch_header_subtitle">Your preset will be applied to every video in this batch.</string>
     <string name="batch_inplace_label">Replace originals</string>
     <string name="batch_inplace_caption">After each save, ask Android to delete the source video. Confirmation dialog at the end.</string>
+    <string name="inplace_label_singular">Replace original</string>
+    <string name="inplace_label_plural">Replace originals</string>
+    <string name="inplace_caption_singular">Save the compressed copy in the original\'s folder, under the original\'s name, and delete the original — seamless replace. Android asks before deleting.</string>
+    <string name="inplace_caption_plural">Save each compressed copy in its original\'s folder under the original\'s name, then delete the originals. Android shows ONE confirmation dialog at the end of the batch.</string>
     <string name="batch_summary_title">%1$d / %2$d videos saved</string>
     <string name="batch_summary_saved">Saved %1$s</string>
     <string name="batch_summary_failures">%1$d failed</string>

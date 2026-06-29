@@ -20,8 +20,8 @@ android {
         targetSdk = 36
         // Reset to 1 / 1.0.0 — this is the first release of Green Compressor
         // as its own app, not a continuation of upstream's version numbers.
-        versionCode = 3
-        versionName = "1.0.2"
+        versionCode = 1
+        versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

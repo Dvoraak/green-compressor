@@ -10,6 +10,14 @@
          every compress — defeating the archive workflow. -->
     <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
 
+    <!-- Needed to (a) convert photo-picker URIs to real MediaStore URIs via
+         MediaStore.getMediaUri, which is the only thing createDeleteRequest
+         accepts, and (b) keep ACCESS_MEDIA_LOCATION un-redacted on the
+         picker path. Without READ_MEDIA_VIDEO the in-place "Replace
+         originals" toggle silently no-ops because we never get a deletable
+         URI to hand to the system dialog. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -30,9 +38,19 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
             
-            <!-- Handle shared videos -->
+            <!-- Handle a single shared video. Other apps' Share sheet ACTION_SEND
+                 with a video/* payload routes here. -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="video/*" />
+            </intent-filter>
+
+            <!-- Handle multiple shared videos (e.g. share sheet "select multiple"
+                 → Green Compressor). Routes into the same batch queue the in-app
+                 picker uses. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="video/*" />
             </intent-filter>

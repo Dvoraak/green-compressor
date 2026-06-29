@@ -81,9 +81,9 @@ import kotlinx.coroutines.flow.collect
 class MainActivity : ComponentActivity() {
     private val viewModel by viewModels<CompressorViewModel>()
 
-    private val mediaLocationPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { /* result intentionally ignored — GPS preservation is best-effort */ }
+    private val mediaPermissionsLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { /* result intentionally ignored — GPS / in-place delete are best-effort */ }
 
     @SuppressLint("SourceLockedOrientationActivity")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -94,32 +94,60 @@ class MainActivity : ComponentActivity() {
             requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         }
 
-        // Request ACCESS_MEDIA_LOCATION once on launch. Without it, MediaStore.setRequireOriginal
-        // throws SecurityException and we fall back to redacted URIs — the picker returns content
-        // with GPS scrubbed, defeating the metadata-preservation feature for any video the user
-        // didn't shoot in-app. If the user denies, the rest of the app still works fine.
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-            val granted = checkSelfPermission(android.Manifest.permission.ACCESS_MEDIA_LOCATION) ==
-                android.content.pm.PackageManager.PERMISSION_GRANTED
-            if (!granted) {
-                mediaLocationPermissionLauncher.launch(android.Manifest.permission.ACCESS_MEDIA_LOCATION)
-            }
+        // Two runtime permissions matter for this app:
+        //   - ACCESS_MEDIA_LOCATION: lets MediaStore.setRequireOriginal hand back
+        //     un-redacted URIs so we can read GPS off the source.
+        //   - READ_MEDIA_VIDEO (API 33+): required to call MediaStore.getMediaUri,
+        //     which converts the photo picker's content://media/picker/... URIs
+        //     into the content://media/external/video/... form that
+        //     createDeleteRequest accepts. Without it, the "Replace originals"
+        //     toggle silently no-ops.
+        val perms = mutableListOf<String>()
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q &&
+            checkSelfPermission(android.Manifest.permission.ACCESS_MEDIA_LOCATION) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            perms.add(android.Manifest.permission.ACCESS_MEDIA_LOCATION)
+        }
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(android.Manifest.permission.READ_MEDIA_VIDEO) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            perms.add(android.Manifest.permission.READ_MEDIA_VIDEO)
+        }
+        if (perms.isNotEmpty()) {
+            mediaPermissionsLauncher.launch(perms.toTypedArray())
         }
 
         enableEdgeToEdge()
 
-        // Handle incoming share intent
-        if (intent?.action == Intent.ACTION_SEND && intent.type?.startsWith("video/") == true) {
-            val uri = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                intent.getParcelableExtra(Intent.EXTRA_STREAM)
+        // Handle incoming Share intent — single OR multiple videos. Other apps'
+        // share sheets call into us with one of these two actions; route both
+        // through the same batch queue the in-app picker uses so the rest of
+        // the flow (preset, in-place toggle, summary) works identically.
+        val shareUris: List<Uri>? = when (intent?.action) {
+            Intent.ACTION_SEND -> {
+                if (intent.type?.startsWith("video/") == true) {
+                    val u = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                    } else {
+                        @Suppress("DEPRECATION") intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+                    }
+                    if (u != null) listOf(u) else null
+                } else null
             }
-            
-            if (uri != null) {
-                viewModel.updateSelectedUri(this, uri)
+            Intent.ACTION_SEND_MULTIPLE -> {
+                if (intent.type?.startsWith("video/") == true) {
+                    val list = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                    } else {
+                        @Suppress("DEPRECATION") intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
+                    }
+                    list?.toList()
+                } else null
             }
+            else -> null
+        }
+        if (!shareUris.isNullOrEmpty()) {
+            viewModel.setBatchUris(this, shareUris)
         }
 
         setContent {
@@ -194,11 +222,15 @@ fun CompressorApp(viewModel: CompressorViewModel) {
     }
 
     // Fires after the system "Allow this app to delete these videos?" dialog returns.
-    // Whether the user accepted or denied, we clear the queue locally so the UI moves on.
+    // The result code tells us whether the user confirmed (RESULT_OK) or denied.
+    // finalizeInPlace flips each pending compressed copy from its temp name to
+    // either the original's exact DISPLAY_NAME (confirm — true seamless replace)
+    // or a Movies/Compressor fallback (deny).
     val deleteOriginalsLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
-    ) { _ ->
-        viewModel.consumePendingDeletes()
+    ) { result ->
+        val confirmed = result.resultCode == android.app.Activity.RESULT_OK
+        viewModel.finalizeInPlace(context, confirmed)
     }
 
     // When the batch finishes with in-place ON, batch-end emits a list of URIs to delete.
@@ -206,21 +238,30 @@ fun CompressorApp(viewModel: CompressorViewModel) {
     // the whole batch instead of one per file.
     LaunchedEffect(state.pendingDeleteUris) {
         val urisToDelete = state.pendingDeleteUris
+        android.util.Log.i(
+            "GreenCompressor",
+            "LaunchedEffect(pendingDeleteUris) size=${urisToDelete.size} sdk=${android.os.Build.VERSION.SDK_INT}"
+        )
         if (urisToDelete.isNotEmpty() && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
             try {
                 val pendingIntent = android.provider.MediaStore.createDeleteRequest(
                     context.contentResolver,
                     urisToDelete
                 )
+                android.util.Log.i("GreenCompressor", "createDeleteRequest built, launching IntentSender")
                 val request = androidx.activity.result.IntentSenderRequest.Builder(pendingIntent.intentSender).build()
                 deleteOriginalsLauncher.launch(request)
             } catch (e: Exception) {
-                e.printStackTrace()
-                viewModel.consumePendingDeletes()
+                // PendingIntent build threw — treat as "user denied" so any
+                // pending in-place saves still get unpended and moved out of
+                // the originals' folder. Without this they'd stay IS_PENDING
+                // forever and the user would lose their compressed copy.
+                android.util.Log.e("GreenCompressor", "createDeleteRequest failed", e)
+                viewModel.finalizeInPlace(context, confirmed = false)
             }
         } else if (urisToDelete.isNotEmpty()) {
-            // API < 30 has no batch delete confirmation API; we just leave the originals alone.
-            viewModel.consumePendingDeletes()
+            android.util.Log.w("GreenCompressor", "API ${android.os.Build.VERSION.SDK_INT} too old for createDeleteRequest")
+            viewModel.finalizeInPlace(context, confirmed = false)
         }
     }
     
@@ -703,18 +744,11 @@ fun ResultScreen(
         
         Spacer(modifier = Modifier.height(24.dp))
         
-        // The upstream "buy me a coffee" link goes to JoshAtticus; this fork swaps it
-        // for an attribution line that links back to the original project — MIT
-        // requires preserving the copyright notice, this surfaces it in-app too.
-        TextButton(
-            onClick = { uriHandler.openUri("https://github.com/JoshAtticus/Compressor") }
-        ) {
-             Text(
-                stringResource(R.string.attribution_upstream),
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
-            )
-        }
+        // Upstream attribution lives in the InfoDialog now (a small "Fork of
+        // Compressor by JoshAtticus" credit) — keeping a giant link on the
+        // success screen made the fork look like upstream's app. The MIT
+        // notice remains in NOTICE.md + InfoDialog + LICENSE which is what
+        // the license actually requires.
     }
     }
 }
@@ -736,7 +770,11 @@ fun InfoDialog(
         title = {
             Column {
                  Text(stringResource(R.string.info_title), style = MaterialTheme.typography.titleLarge)
-                 Text("Green Compressor v${state.appInfoVersion}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                 Text(
+                     "Green Compressor v${state.appInfoVersion} — by Dvoraak",
+                     style = MaterialTheme.typography.bodySmall,
+                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                 )
             }
         },
         text = {
@@ -1906,7 +1944,10 @@ fun Modifier.expressiveScale(interactionSource: androidx.compose.foundation.inte
 
 @Composable
 fun BatchBanner(state: CompressorUiState, viewModel: CompressorViewModel) {
-    if (!state.isBatch) return
+    // Renders for both mono (1 video) and batch (N videos). Mono only really
+    // needs the in-place toggle here, so the batch-count header collapses
+    // when batchQueue.size <= 1.
+    val isBatch = state.isBatch
     ElevatedCard(
         modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
         shape = RoundedCornerShape(20.dp),
@@ -1915,19 +1956,21 @@ fun BatchBanner(state: CompressorUiState, viewModel: CompressorViewModel) {
         ),
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
-            Text(
-                stringResource(R.string.batch_header_title, state.batchTotal),
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onPrimaryContainer,
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                stringResource(R.string.batch_header_subtitle),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f),
-            )
-            Spacer(modifier = Modifier.height(12.dp))
+            if (isBatch) {
+                Text(
+                    stringResource(R.string.batch_header_title, state.batchTotal),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    stringResource(R.string.batch_header_subtitle),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f),
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+            }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -1935,13 +1978,17 @@ fun BatchBanner(state: CompressorUiState, viewModel: CompressorViewModel) {
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        stringResource(R.string.batch_inplace_label),
+                        stringResource(
+                            if (isBatch) R.string.inplace_label_plural else R.string.inplace_label_singular
+                        ),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onPrimaryContainer,
                         fontWeight = FontWeight.Medium,
                     )
                     Text(
-                        stringResource(R.string.batch_inplace_caption),
+                        stringResource(
+                            if (isBatch) R.string.inplace_caption_plural else R.string.inplace_caption_singular
+                        ),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f),
                     )
